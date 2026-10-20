@@ -1,16 +1,28 @@
 # RTL / Arabic editing — fork progress & continuity
 
 **Status:** display, inline-editor joining, applying edits, and moving edited boxes all work on the
-real test file; all code green and **committed** on `rtl-arabic-editing` (6 commits, not yet
-pushed). · **Last updated:** 2026-10-20.
+real test file. Pushed; **two PRs open** — fork **zaidshurbaji/pdfcraft#1** (all work) and upstream
+**storytold/pdfcraft#3695** (the upstreamable commits 1–4 only). The two **Major** findings from the
+upstream PR's automated reviewer (CodeRabbit) are fixed and on both branches (§9, §10). A Windows
+**MSI** of this build was produced (`dist/release/pdfcraft-0.10.1-rtl-arabic-windows-x64.msi`).
+· **Last updated:** 2026-10-20.
 
 Fork: **zaidshurbaji/pdfcraft** (upstream: storytold/pdfcraft). Branch: **`rtl-arabic-editing`**.
 Goal: make editing existing **right-to-left (Arabic/Hebrew)** text in PDFs work — it was
 displaying reversed, letters disconnected, and refusing to apply edits.
 
 ## Current state (read first for a new session)
-- On branch `rtl-arabic-editing`, **6 commits made, not yet pushed** (working tree now clean). The
-  commits, in order:
+- **Two PRs open (pushed):**
+  - **Fork — zaidshurbaji/pdfcraft#1** — branch `rtl-arabic-editing`, all the work below (commits
+    1–6) plus the two review fixes (§9, §10). Into the fork's own `main`.
+  - **Upstream — storytold/pdfcraft#3695** — branch `feat/rtl-arabic-upstream`, commits 1–4 **only**
+    (bidi + RTL editing) rebased onto the latest upstream `main`, plus §9/§10. **Excludes** the
+    fork-only font policy (commit 5, §8) and this doc, since upstream deliberately keeps the strict
+    open-licence rule. Its automated reviewer (CodeRabbit, a bot — not a maintainer) posted findings;
+    the two **Major** ones are fixed (§9, §10). Deferred (open): 2 Minor (`is_bidi` x-order
+    inference; dropped GPOS `x_offset`), 2 perf (bidi early-return; cache the flattened fallback
+    face), 1 security (quadratic-bidi DoS guard).
+- On branch `rtl-arabic-editing`, the commits, in order:
   1. `feat(vendor): bidirectional text layout (UAX #9) in vendored epaint` — §1 (upstreamable unit:
      `vendor/epaint/**`, the `[patch.crates-io]` entry, `vendor/README.md`, the fonts.rs bidi tests)
   2. `feat(edit): apply edits to existing right-to-left text` — §2 apply fallback + §3
@@ -23,17 +35,23 @@ displaying reversed, letters disconnected, and refusing to apply edits.
      embedding policy (§8: `validate_document_input` + its revert-proven test), kept its own commit
      because it is NOT upstreamable
   6. `docs: RTL/Arabic editing progress and continuity doc` — this file
-- Gates (all re-run green this session with `CRAFT_FONTS_DIR` set before committing): `cargo fmt
-  --check`, `cargo xtask layers`, `cargo xtask assets`, clippy clean on `fonts`/`edit`/`ui-egui`;
-  tests — fonts **75**, edit **188**, ui-egui `--test fonts` **13**, ui-egui `--lib edit_text_ui`
-  **9**. Commit 2's snapshot was additionally checked standalone (the only intra-file split).
+  7. `fix(edit): refuse per-range formatting across a unified contextual row, don't flatten it` — §9
+  8. `feat(vendor): one cursor column per character on decomposed clusters in epaint` — §10
+  (commits 7–8 are the two Major review fixes; they were cherry-picked onto `feat/rtl-arabic-upstream`
+  for PR #3695 too.)
+- Gates (re-run green with `CRAFT_FONTS_DIR` set): `cargo fmt --check`, `cargo xtask layers`/`assets`,
+  clippy `-D warnings` clean on `fonts`/`edit`/`ui-egui`; tests — fonts **75**, edit **188/198**
+  (fork/upstream base), ui-egui `--test fonts` **13**, `--lib edit_text_ui` **9**.
+  - NOTE: the ui-egui `control` kittest suite crashes (`STATUS_ACCESS_VIOLATION`) on **this machine**
+    — it crashes identically on the base with the fixes stashed, so it is a pre-existing
+    headless-GPU/kittest issue here, not a regression. CI runs it on proper infrastructure.
 - Verified in the running app on `aqaba.pdf` (earlier this session): RTL display order,
   inline-editor joining, applying an edit to an Arabic paragraph, and moving an already-edited
-  Arabic box.
-- Next: **push the branch + open the PR** (fork → may stay fork-only; the upstreamable commits are
-  1–4, commit 5 is fork-only), then **auto-use installed matching face** (STILL TODO #1). Candidate
-  follow-up: `add_content` embeds a *variable* craft face, which blocks later edits of added Arabic
-  (separate from everything above).
+  Arabic box. §9 additionally verified via the CLI (see §9).
+- Next: watch the PRs (CodeRabbit re-review + CI on #3695 — do not poll); optionally address the
+  deferred Minor/perf/security findings; **auto-use installed matching face** (STILL TODO #1).
+  Candidate follow-up: `add_content` embeds a *variable* craft face, which blocks later edits of
+  added Arabic (separate from everything above).
 
 ## Environment / how to build & run
 
@@ -234,9 +252,46 @@ repo's existing `vendor/` + `[patch.crates-io]` convention (see `vendor/README.m
   Restoring the allowlist was confirmed to fail it at "a valid embeddable font with no open-licence
   name must validate".
 
+### 9. Row unification refuses mixed per-range styling (CodeRabbit Major) — `crates/edit/src/text_regions.rs`
+- `rewrite_styled_block` unified a mixed contextual/bidi row by setting every character's
+  styled-source-line index (`c.1`) to the anchor's. `c.1` keys every per-range style (`overrides`,
+  `underlines`, size, scale, colour, char spacing), so colouring/resizing/underlining one word of an
+  Arabic row flattened the whole row to the anchor's style while still reporting success — the user's
+  formatting silently lost.
+- Fix: unify only the font **resource** (`c.2`); a row whose characters carry different style indices
+  (`c.1`) is **refused** ("formatting part of a joined or right-to-left row separately isn't supported
+  yet") instead. Shaping each styled segment apart would break joining; refusing is correct until
+  per-segment contextual shaping exists.
+- Verified via the CLI on `aqaba.pdf` that §6's multi-run **paragraph 15** edit still **applies** and
+  reshapes on `NotoSansArabic` (its runs differ by subset/resource, same style) — so this does not
+  regress the resource-only unification. **No unit test:** the edit-crate harness cannot shape an
+  Arabic edit (it routes to a Japanese fallback that lacks the glyphs; a real static Arabic subset is
+  needed) — the same limitation documented in §6.
+
+### 10. One cursor column per character on decomposed clusters (CodeRabbit Major) — `vendor/epaint/src/text/`
+- Noto Sans Arabic decomposes dotted letters (ب ت ث ن ي) into a base plus separate i'jam dot glyphs
+  via `ccmp`, so a cluster shapes to more glyphs than characters and `row.glyphs.len() > chars`.
+  egui's caret/selection equate glyph index with character index, so the caret, selection and
+  deletions drifted by one per dot over very common Arabic text. The RTL work relied on this
+  invariant and the test hid the drift by filtering surplus glyphs.
+- Fix: `Glyph::render_only` marks the surplus decomposition glyphs (preferring the zero-advance dots
+  so an advancing base stays the cursor column); `emit_continuation_glyphs` gains this symmetric case
+  to the zero-width padding it already does for ligatures. The tessellator still draws them, but
+  `Row::text`, `char_count_excluding_newline`, `char_at` and `x_offset` skip them, so cursor columns
+  equal the character count. Non-decomposed text flags nothing → LTR/CJK layout and cursoring are
+  byte-identical to upstream.
+- Test (revert-proven): `fonts::arabic_text_lays_out_right_to_left_in_logical_order` now asserts, via
+  the public API, that the row has more glyphs than characters yet reports one caret column per
+  character and `Row::text()` equals the input in logical order. Reverting the flagging fails it at
+  "one caret column per character". `latin_text_layout_is_unchanged_by_bidi` and `edit_text_ui` stay
+  green.
+
 ## NEXT
 
-- **Push the branch and open the PR** (fork-first; see below for the upstreamable split).
+- Watch both PRs (CodeRabbit re-review + CI on #3695 — do not poll). Optionally address the deferred
+  findings on #3695: 2 Minor (`is_bidi` x-order inference; dropped GPOS `x_offset`), 2 perf
+  (`bidi_reorder_row` early-return; cache the flattened fallback face in `shape_source`), 1 security
+  (a work budget / cancellation on the quadratic bidi path).
 
 ## STILL TODO (not started)
 
@@ -251,9 +306,11 @@ repo's existing `vendor/` + `[patch.crates-io]` convention (see `vendor/README.m
 
 ## Key files touched
 - `Cargo.toml` — `[patch.crates-io] epaint = { path = "vendor/epaint" }`
-- `vendor/epaint/**` — vendored + bidi patch; `vendor/epaint/Cargo.toml` adds `unicode-bidi`
-- `vendor/README.md` — epaint patch documented
-- `crates/edit/src/text_regions.rs` — `shape_source` fallback + `script_fallback_face` + test
+- `vendor/epaint/**` — vendored + bidi patch (§1); `Glyph::render_only` + the decomposition fix in
+  `text_layout.rs`/`text_layout_types.rs` (§10); `vendor/epaint/Cargo.toml` adds `unicode-bidi`
+- `vendor/README.md` — both epaint patches documented
+- `crates/edit/src/text_regions.rs` — `shape_source` fallback + `script_fallback_face` + test (§2);
+  `rewrite_styled_block` row-unification unifies resource only, refuses mixed styling (§6, §9)
 - `crates/edit/src/objects.rs` — `editable_objects` drops invalid-geometry objects instead of
   refusing the page (+ `tests.rs` regression)
 - `crates/edit/src/text.rs` — `translate_blocks` moves a line's show ops only, so an edited
@@ -265,7 +322,14 @@ repo's existing `vendor/` + `[patch.crates-io]` convention (see `vendor/README.m
 - `crates/ui-egui/tests/fonts.rs` — bidi layout tests
 
 ## Revision history
-- 2026-10-20 (latest) — Closed the §8 test gap: found the first-draft `fsType` check in
+- 2026-10-20 (latest) — Pushed both branches and opened **two PRs**: fork #1 and upstream #3695
+  (commits 1–4 only). Built & delivered a Windows **MSI** (`packaging/windows/package.ps1`).
+  Addressed the upstream reviewer bot's two **Major** findings: §9 (refuse mixed per-range styling on
+  a unified row, verified no §6 regression via the CLI) and §10 (render-only decomposition glyphs so
+  the caret stops drifting on dotted Arabic). Both cherry-picked to both branches; green (fonts 13,
+  edit tests, edit_text_ui 9, clippy/fmt). The ui-egui `control` kittest crashes on this machine
+  pre-existing (environmental), not a regression. Deferred the 2 Minor + 2 perf + 1 security findings.
+- 2026-10-20 — Closed the §8 test gap: found the first-draft `fsType` check in
   `validate_document_input` was redundant (embeddability is already enforced by `validate()` via
   `names()`), so narrowed the fork change to dropping the open-licence allowlist and added a
   revert-proven test (`document_input_no_longer_requires_an_open_licence_name`). Commits 5 and 6
