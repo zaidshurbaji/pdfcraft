@@ -43,10 +43,24 @@ pub fn names(bytes: &[u8]) -> Result<(String, String), String> {
     Ok((family, postscript))
 }
 
-/// A selected external font is document input. Require its own open-licence declaration;
-/// never turn a proprietary system-interface fallback into an exported PDF font.
+/// A selected external font is document input. Upstream additionally requires an open-licence
+/// *name* (OFL/Apache/…); this fork drops that allowlist so installed device fonts — including
+/// proprietary faces such as Arial or Sakkal Majalla — can be used for editing and re-embedded, the
+/// way Acrobat allows, which is what users expect when a matching font is installed.
+///
+/// Font validity and the font's own OS/2 `fsType` embedding permissions are still enforced: `names()`
+/// (called first) runs [`validate`], which rejects restricted-licence (0x0002), preview/print-only
+/// (0x0004) and bitmap-embedding-only (0x0200) faces. What remains here are two conservative
+/// asset-policy guards — the Source-Han family exclusion and the Adobe-authored exclusion — both of
+/// which could be relaxed for fuller Acrobat parity. Interface fallback fonts never reach this path
+/// (they are not in the document-font catalogue), so a UI fallback is still never exported.
+///
+/// NOTE: dropping the open-licence allowlist diverges from upstream storytold/pdfcraft; it is a
+/// deliberate fork choice (see `docs/rtl-arabic-progress.md`).
 pub fn validate_document_input(bytes: &[u8]) -> Result<(), String> {
     use skrifa::string::StringId;
+    // `names()` runs `validate()`, so font validity and the fsType embedding permissions are
+    // already enforced before any check here.
     let (family, _) = names(bytes)?;
     let key = face_key(&family);
     if ["sourcehan", "sourceserif", "sourcesans", "notosanscjk", "notoserifcjk"].iter().any(|n| key.starts_with(n)) {
@@ -57,13 +71,6 @@ pub fn validate_document_input(bytes: &[u8]) -> Result<(), String> {
         [StringId::COPYRIGHT_NOTICE, StringId::MANUFACTURER].into_iter().flat_map(|id| f.localized_strings(id)).map(|s| s.to_string()).collect();
     if attribution.to_ascii_lowercase().contains("adobe") {
         return Err("Adobe-authored font assets are excluded by the project's asset policy".into());
-    }
-    let license: String = f.localized_strings(StringId::LICENSE_DESCRIPTION).map(|s| s.to_string()).collect();
-    if !["SIL OPEN FONT", "SIL Open Font", "Apache License", "Ubuntu Font Licence", "Bitstream Vera", "MIT License"]
-        .iter()
-        .any(|l| license.contains(l))
-    {
-        return Err("select an openly licensed font whose name table declares its licence (OFL, Apache, Ubuntu, Bitstream Vera or MIT)".into());
     }
     Ok(())
 }
@@ -94,6 +101,79 @@ pub fn validate(bytes: &[u8]) -> Result<(), String> {
         return Err("the selected font maps Unicode to a glyph outside its program".into());
     }
     Ok(())
+}
+
+/// Flatten a variable font to a static instance at its default axis location, so it can be embedded
+/// (editable embedding requires a static instance; see [`validate`]). A variable font's `glyf`
+/// outlines are already the default instance, so dropping the variation tables yields a valid
+/// static font with its `cmap`, `GSUB`/`GPOS` (shaping) and metrics intact. A font that is already
+/// static, or that cannot be parsed, is returned unchanged. The craft-fonts Arabic/Hebrew/Thai
+/// fallback faces are shipped as variable fonts, and this makes them usable for edited text.
+pub fn static_instance(bytes: &[u8]) -> Vec<u8> {
+    use skrifa::raw::types::Tag;
+
+    let Ok(font) = FontRef::new(bytes) else {
+        return bytes.to_vec();
+    };
+    if font.fvar().is_err() {
+        return bytes.to_vec(); // Already a static font.
+    }
+    // Variation tables. The default-instance outlines stay in `glyf`, so removing these leaves a
+    // correct static font; everything shaping and metrics need (cmap, glyf/loca, hmtx, GSUB, GPOS,
+    // GDEF, …) is kept.
+    let drop = [
+        Tag::new(b"fvar"),
+        Tag::new(b"gvar"),
+        Tag::new(b"avar"),
+        Tag::new(b"cvar"),
+        Tag::new(b"HVAR"),
+        Tag::new(b"VVAR"),
+        Tag::new(b"MVAR"),
+        Tag::new(b"STAT"),
+    ];
+    let mut tables: Vec<(Tag, u32, Vec<u8>)> = Vec::new();
+    for rec in font.table_directory.table_records() {
+        let tag = rec.tag();
+        if drop.contains(&tag) {
+            continue;
+        }
+        let Some(data) = font.table_data(tag) else {
+            continue;
+        };
+        tables.push((tag, rec.checksum(), data.as_bytes().to_vec()));
+    }
+    if tables.is_empty() {
+        return bytes.to_vec();
+    }
+    tables.sort_by_key(|(t, _, _)| *t);
+
+    let n = tables.len() as u16;
+    let entry_selector = (15 - n.leading_zeros()) as u16;
+    let search_range = (1u16 << entry_selector) * 16;
+    let range_shift = n * 16 - search_range;
+
+    let mut out = Vec::new();
+    out.extend_from_slice(&font.table_directory.sfnt_version().to_be_bytes());
+    out.extend_from_slice(&n.to_be_bytes());
+    out.extend_from_slice(&search_range.to_be_bytes());
+    out.extend_from_slice(&entry_selector.to_be_bytes());
+    out.extend_from_slice(&range_shift.to_be_bytes());
+
+    let mut offset = 12 + 16 * tables.len();
+    let mut blob = Vec::new();
+    for (tag, checksum, data) in &tables {
+        // `data` is copied byte for byte, so its original checksum is still valid.
+        out.extend_from_slice(&tag.to_be_bytes());
+        out.extend_from_slice(&checksum.to_be_bytes());
+        out.extend_from_slice(&(offset as u32).to_be_bytes());
+        out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        blob.extend_from_slice(data);
+        let pad = (4 - data.len() % 4) % 4;
+        blob.extend(std::iter::repeat_n(0u8, pad));
+        offset += data.len() + pad;
+    }
+    out.extend_from_slice(&blob);
+    out
 }
 
 fn stream(doc: &mut Document, bytes: Vec<u8>) -> Object {
@@ -337,6 +417,95 @@ mod tests {
         embed(&mut doc, &mut second, bytes, "Inter").unwrap();
         assert_eq!(doc.scan_objects().filter(|(_, o)| matches!(o.as_ref(), Object::Stream(s) if s.dict.get(b"PCFullFont").is_some())).count(), 1);
         assert_eq!(face_key("ABCDEF+Droid-Sans-Fallback"), face_key("Droid Sans Fallback"));
+    }
+
+    #[test]
+    fn static_instance_flattens_a_variable_font_so_it_embeds_and_still_shapes() {
+        // A static font is returned unchanged and still embeds.
+        let inter = include_bytes!("../../../assets/fonts/Inter-Regular.ttf");
+        assert_eq!(static_instance(inter), inter.to_vec(), "a static font is unchanged");
+        let garbage = static_instance(b"not a font");
+        assert_eq!(garbage, b"not a font".to_vec());
+
+        // The bundled Arabic fallback is a variable font: validate rejects it, but its static
+        // instance validates, still covers Arabic, and still shapes right-to-left.
+        let Some(face) = crate::document_arabic_font() else {
+            eprintln!("skipping variable-font flattening: no craft-fonts Arab face (set CRAFT_FONTS_DIR)");
+            return;
+        };
+        if validate(face.bytes).is_ok() {
+            eprintln!("skipping: the bundled Arabic face is already static");
+            return;
+        }
+        let flat = static_instance(face.bytes);
+        assert!(validate(&flat).is_ok(), "the static instance must be embeddable");
+        assert!(FontRef::new(&flat).unwrap().fvar().is_err(), "no fvar after flattening");
+        assert!(covers(&flat, "مرحبا"), "the static instance still covers Arabic");
+        assert!(crate::source_shaping::shape(&flat, "مرحبا").is_ok(), "it still shapes");
+        // It actually embeds into a document.
+        let mut doc = Document::new_empty();
+        let mut fonts = Dict::new();
+        let mapping = [("م".to_string(), FontRef::new(&flat).unwrap().charmap().map('م').unwrap())];
+        assert!(embed_mapping(&mut doc, &mut fonts, &flat, "Noto Sans Arabic", &mapping).is_ok());
+    }
+
+    /// The fork's change to `validate_document_input`: it no longer requires an open-licence *name*,
+    /// so a valid, embeddable font with no recognised licence string now validates (upstream refused
+    /// it). The fsType embedding permissions are still enforced, by `validate()` via `names()`, and
+    /// the Source-Han and Adobe-authored asset guards still fire.
+    ///
+    /// Patches are made by overwriting fields in place; sfnt parsing does not verify table
+    /// checksums. Reverting the fork change (restoring the open-licence allowlist) was confirmed to
+    /// fail this test at "a valid embeddable font with no open-licence name must validate".
+    #[test]
+    fn document_input_no_longer_requires_an_open_licence_name() {
+        let inter = include_bytes!("../../../assets/fonts/Inter-Regular.ttf");
+
+        // Offset of a top-level sfnt table's data.
+        fn table(bytes: &[u8], tag: &[u8; 4]) -> usize {
+            let n = u16::from_be_bytes([bytes[4], bytes[5]]) as usize;
+            let rec = (0..n).map(|i| 12 + i * 16).find(|&r| &bytes[r..r + 4] == tag).expect("table present");
+            u32::from_be_bytes(bytes[rec + 8..rec + 12].try_into().unwrap()) as usize
+        }
+        // Rename every `name` record carrying `name_id` to an unused id, so lookups of it see
+        // nothing — here used to strip the licence-description (13) string.
+        fn drop_name(bytes: &[u8], name_id: u16) -> Vec<u8> {
+            let name = table(bytes, b"name");
+            let count = u16::from_be_bytes([bytes[name + 2], bytes[name + 3]]) as usize;
+            let mut out = bytes.to_vec();
+            for i in 0..count {
+                let rec = name + 6 + i * 12;
+                if u16::from_be_bytes([out[rec + 6], out[rec + 7]]) == name_id {
+                    out[rec + 6..rec + 8].copy_from_slice(&0xFFFE_u16.to_be_bytes());
+                }
+            }
+            out
+        }
+        // Overwrite the OS/2 `fsType` (byte 8 of the table).
+        fn with_fs_type(bytes: &[u8], bits: u16) -> Vec<u8> {
+            let os2 = table(bytes, b"OS/2");
+            let mut out = bytes.to_vec();
+            out[os2 + 8..os2 + 10].copy_from_slice(&bits.to_be_bytes());
+            out
+        }
+
+        // The fork change: a valid, embeddable font with its open-licence name stripped still
+        // validates (upstream's allowlist refused it). This is the assertion the revert flips.
+        let no_licence = drop_name(inter, 13);
+        assert!(
+            FontRef::new(&no_licence).unwrap().localized_strings(skrifa::string::StringId::LICENSE_DESCRIPTION).next().is_none(),
+            "the licence string was removed"
+        );
+        assert!(validate(&no_licence).is_ok(), "the font is otherwise valid and embeddable");
+        assert!(validate_document_input(&no_licence).is_ok(), "a valid embeddable font with no open-licence name must validate");
+
+        // Inter as-is still validates.
+        assert!(validate_document_input(inter).is_ok());
+        // fsType embedding permissions are still enforced (via validate/names), so restricted
+        // (0x0002), preview/print-only (0x0004) and bitmap-embedding-only (0x0200) faces are refused.
+        for bad in [0x0002u16, 0x0004, 0x0200] {
+            assert!(validate_document_input(&with_fs_type(inter, bad)).is_err(), "fsType {bad:#06x} must be refused");
+        }
     }
 
     #[test]
