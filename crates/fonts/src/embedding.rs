@@ -43,10 +43,24 @@ pub fn names(bytes: &[u8]) -> Result<(String, String), String> {
     Ok((family, postscript))
 }
 
-/// A selected external font is document input. Require its own open-licence declaration;
-/// never turn a proprietary system-interface fallback into an exported PDF font.
+/// A selected external font is document input. Upstream additionally requires an open-licence
+/// *name* (OFL/Apache/…); this fork drops that allowlist so installed device fonts — including
+/// proprietary faces such as Arial or Sakkal Majalla — can be used for editing and re-embedded, the
+/// way Acrobat allows, which is what users expect when a matching font is installed.
+///
+/// Font validity and the font's own OS/2 `fsType` embedding permissions are still enforced: `names()`
+/// (called first) runs [`validate`], which rejects restricted-licence (0x0002), preview/print-only
+/// (0x0004) and bitmap-embedding-only (0x0200) faces. What remains here are two conservative
+/// asset-policy guards — the Source-Han family exclusion and the Adobe-authored exclusion — both of
+/// which could be relaxed for fuller Acrobat parity. Interface fallback fonts never reach this path
+/// (they are not in the document-font catalogue), so a UI fallback is still never exported.
+///
+/// NOTE: dropping the open-licence allowlist diverges from upstream storytold/pdfcraft; it is a
+/// deliberate fork choice (see `docs/rtl-arabic-progress.md`).
 pub fn validate_document_input(bytes: &[u8]) -> Result<(), String> {
     use skrifa::string::StringId;
+    // `names()` runs `validate()`, so font validity and the fsType embedding permissions are
+    // already enforced before any check here.
     let (family, _) = names(bytes)?;
     let key = face_key(&family);
     if ["sourcehan", "sourceserif", "sourcesans", "notosanscjk", "notoserifcjk"].iter().any(|n| key.starts_with(n)) {
@@ -57,13 +71,6 @@ pub fn validate_document_input(bytes: &[u8]) -> Result<(), String> {
         [StringId::COPYRIGHT_NOTICE, StringId::MANUFACTURER].into_iter().flat_map(|id| f.localized_strings(id)).map(|s| s.to_string()).collect();
     if attribution.to_ascii_lowercase().contains("adobe") {
         return Err("Adobe-authored font assets are excluded by the project's asset policy".into());
-    }
-    let license: String = f.localized_strings(StringId::LICENSE_DESCRIPTION).map(|s| s.to_string()).collect();
-    if !["SIL OPEN FONT", "SIL Open Font", "Apache License", "Ubuntu Font Licence", "Bitstream Vera", "MIT License"]
-        .iter()
-        .any(|l| license.contains(l))
-    {
-        return Err("select an openly licensed font whose name table declares its licence (OFL, Apache, Ubuntu, Bitstream Vera or MIT)".into());
     }
     Ok(())
 }
@@ -440,6 +447,65 @@ mod tests {
         let mut fonts = Dict::new();
         let mapping = [("م".to_string(), FontRef::new(&flat).unwrap().charmap().map('م').unwrap())];
         assert!(embed_mapping(&mut doc, &mut fonts, &flat, "Noto Sans Arabic", &mapping).is_ok());
+    }
+
+    /// The fork's change to `validate_document_input`: it no longer requires an open-licence *name*,
+    /// so a valid, embeddable font with no recognised licence string now validates (upstream refused
+    /// it). The fsType embedding permissions are still enforced, by `validate()` via `names()`, and
+    /// the Source-Han and Adobe-authored asset guards still fire.
+    ///
+    /// Patches are made by overwriting fields in place; sfnt parsing does not verify table
+    /// checksums. Reverting the fork change (restoring the open-licence allowlist) was confirmed to
+    /// fail this test at "a valid embeddable font with no open-licence name must validate".
+    #[test]
+    fn document_input_no_longer_requires_an_open_licence_name() {
+        let inter = include_bytes!("../../../assets/fonts/Inter-Regular.ttf");
+
+        // Offset of a top-level sfnt table's data.
+        fn table(bytes: &[u8], tag: &[u8; 4]) -> usize {
+            let n = u16::from_be_bytes([bytes[4], bytes[5]]) as usize;
+            let rec = (0..n).map(|i| 12 + i * 16).find(|&r| &bytes[r..r + 4] == tag).expect("table present");
+            u32::from_be_bytes(bytes[rec + 8..rec + 12].try_into().unwrap()) as usize
+        }
+        // Rename every `name` record carrying `name_id` to an unused id, so lookups of it see
+        // nothing — here used to strip the licence-description (13) string.
+        fn drop_name(bytes: &[u8], name_id: u16) -> Vec<u8> {
+            let name = table(bytes, b"name");
+            let count = u16::from_be_bytes([bytes[name + 2], bytes[name + 3]]) as usize;
+            let mut out = bytes.to_vec();
+            for i in 0..count {
+                let rec = name + 6 + i * 12;
+                if u16::from_be_bytes([out[rec + 6], out[rec + 7]]) == name_id {
+                    out[rec + 6..rec + 8].copy_from_slice(&0xFFFE_u16.to_be_bytes());
+                }
+            }
+            out
+        }
+        // Overwrite the OS/2 `fsType` (byte 8 of the table).
+        fn with_fs_type(bytes: &[u8], bits: u16) -> Vec<u8> {
+            let os2 = table(bytes, b"OS/2");
+            let mut out = bytes.to_vec();
+            out[os2 + 8..os2 + 10].copy_from_slice(&bits.to_be_bytes());
+            out
+        }
+
+        // The fork change: a valid, embeddable font with its open-licence name stripped still
+        // validates (upstream's allowlist refused it). This is the assertion the revert flips.
+        let no_licence = drop_name(inter, 13);
+        assert!(
+            FontRef::new(&no_licence).unwrap().localized_strings(skrifa::string::StringId::LICENSE_DESCRIPTION).next().is_none(),
+            "the licence string was removed"
+        );
+        assert!(validate(&no_licence).is_ok(), "the font is otherwise valid and embeddable");
+        assert!(validate_document_input(&no_licence).is_ok(), "a valid embeddable font with no open-licence name must validate");
+
+        // Inter as-is still validates.
+        assert!(validate_document_input(inter).is_ok());
+        // fsType embedding permissions are still enforced (via validate/names), so restricted
+        // (0x0002), preview/print-only (0x0004) and bitmap-embedding-only (0x0200) faces are refused.
+        for bad in [0x0002u16, 0x0004, 0x0200] {
+            assert!(validate_document_input(&with_fs_type(inter, bad)).is_err(), "fsType {bad:#06x} must be refused");
+        }
     }
 
     #[test]
